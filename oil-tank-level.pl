@@ -5,11 +5,14 @@ use warnings;
 use YAML qw/Dump LoadFile/;
 use Getopt::Long;
 use LWP::UserAgent;
-use File::Temp qw/tempfile/;
+use File::Temp qw/tempdir/;
+use File::Spec::Functions; # catfile
+use File::Path qw/make_path/;
 use Time::HiRes qw/time/;
 use IPC::Run qw/run timeout/;
 use Log::Log4perl qw(:easy);
 use POSIX qw/strftime/;
+use JSON qw/encode_json/;
 
 my %params;
 GetOptions( \%params,
@@ -22,8 +25,7 @@ GetOptions( \%params,
     'strip_offset=i',
     'image_height=i',
     'edge=i',
-    'confirmation_image=s',
-    'keep_txt_file',
+    'work_dir=s',
     'liter_per_cm=f',
     'output=s',
 );
@@ -51,22 +53,29 @@ my $ua = LWP::UserAgent->new(
     keep_alive  => 1,
     );
 
-my( $fh_image, $image ) = tempfile( SUFFIX => '.jpg', UNLINK => 1 );
-my( $fh_output, $output ) = tempfile( SUFFIX => '.txt', UNLINK => ( $params{keep_txt_file} ? 0 : 1 ) );
-DEBUG( sprintf "Saving image to: %s", $image );
-DEBUG( sprintf "Output image to: %s", $output );
+if( $params{work_dir} and ! -d $params{work_dir} ){
+    make_path( $params{work_dir} ) or die( $! );
+}
+
+my $work_dir = $params{work_dir} || tempdir( CLEANUP => 1 );
+
+my $image_file = catfile( $work_dir, 'image.jpg' );
+my $text_file = catfile( $work_dir, 'output.txt' );
+
+DEBUG( sprintf "Saving image to: %s", $image_file );
+DEBUG( sprintf "Output text to: %s", $text_file );
 
 $ua->get( sprintf( 'http://%s/snapshot.cgi?user=%s&pwd=%s&%u',
             $params{host},
             $params{username},
             $params{password},
             time() ),
-          ':content_file'   => $image,
+          ':content_file'   => $image_file,
           );
 
 my @cmd = ( qw/convert -crop/, $crop, qw/-colorspace Gray -edge/, $params{edge}, qw/-liquid-rescale 1x100%/ );
-push( @cmd, $image );
-push( @cmd, $output );
+push( @cmd, $image_file );
+push( @cmd, $text_file );
 
 my( $in, $out, $err );
 run( \@cmd, \$in, \$out, \$err );
@@ -74,13 +83,26 @@ if( $err ){
     die( $err );
 }
 
-my $header = readline( $fh_output );
+# Do 
+if( $logger->is_debug and $params{work_dir} ){
+    my $edge_file = catfile( $params{work_dir}, 'edge.png' );
+    DEBUG( "Writing edge image out to $edge_file" ); 
+    @cmd = (  qw/convert -crop/, $crop, qw/-colorspace Gray -edge/, $params{edge}, $image_file, $edge_file );
+    run( \@cmd, \$in, \$out, \$err );
+    if( $err ){
+        die( $err );
+    }
+}
+
+open( my $fh_text, '<', $text_file ) or LOGDIE( $! );
+my $header = readline( $fh_text );
 my @pixels;
-while( my $line = readline( $fh_output ) ){
+while( my $line = readline( $fh_text ) ){
     #0,0: ( 29, 29, 29)  #1D1D1D  gray(29,29,29)
     my( $pixel, $brightness ) = ( $line =~ m/^0\,(\d+): \(\s*(\d+),.*$/ );
     push( @pixels, $brightness );
 }
+close( $fh_text );
 
 # Read until we find a value >100
 my $start_search = undef;
@@ -88,9 +110,11 @@ my $level_pixel = undef;
 foreach( 0 .. $#pixels ){
     if( not $start_search and $pixels[$_] > 100 ){
         $start_search = $_;
+        DEBUG( "Starting search for line at pixel $start_search" );
     }
-    if( $start_search and not $level_pixel and $pixels[$_] == 0 ){
+    if( $start_search and not $level_pixel and $pixels[$_] == 0 and $pixels[$_ + 1] == 0 and $pixels[$_ + 2 ] == 0 ){
         $level_pixel = $_;
+        last;
     }
 }
 DEBUG( sprintf "Line is at %0.1f", $level_pixel );
@@ -110,13 +134,14 @@ foreach( sort { $mapping->{$a} <=> $mapping->{$b} } keys( %{ $mapping } ) ){
 DEBUG( sprintf "Before: %u cm | %u px", $before, $mapping->{$before} );
 DEBUG( sprintf "After: %u cm | %u px", $after, $mapping->{$after} );
 
-if( $params{confirmation_image} ){
-    DEBUG( sprintf "Writing confirmation image to %s", $params{confirmation_image} );
+if( $params{work_dir} ){
+    my $redline = catfile( $work_dir, 'red-line.png' );
+    DEBUG( sprintf "Writing red-line image to %s", $redline );
     my( $in, $out, $err );
     my @cmd = qw/convert -fill red -draw/;
     push( @cmd, sprintf( 'line %i,%i %i,%i', $params{strip_offset}, $level_pixel, $params{strip_offset} + $params{strip_width}, $level_pixel ) );
-    push( @cmd, $image );
-    push( @cmd, $params{confirmation_image} );
+    push( @cmd, $image_file );
+    push( @cmd, $redline );
     run( \@cmd, \$in, \$out, \$err );
     if( $err ){
         ERROR( $err );
@@ -131,15 +156,25 @@ INFO( sprintf "Level cm: %0.2f", $level_cm );
 INFO( sprintf "Level liter: %0.2f", $level_liter );
 
 if( $params{output} ){
-    DEBUG( sprintf "Writing output to log file: %s", $params{output} );
-    open( my $fh, '>>', $params{output} ) or die( $! );
     my $time = time();
     my $microsecond = 1000 * ( $time - int( $time ) );
-    printf $fh "{ \"timestamp\": \"%s\", \"level_cm\": %0.1f, \"level_liter\": %u }\n",
-           strftime( '%Y-%m-%dT%H:%M:%S.', gmtime( $time ) ) . sprintf( '%03uZ', $microsecond ),
-           $level_cm,
-           $level_liter;
-    close $fh;
+    my $document = {
+        timestamp   => strftime( '%Y-%m-%dT%H:%M:%S.', gmtime( $time ) ) . sprintf( '%03uZ', $microsecond ),
+        level_cm    => 0 + sprintf( '%0.1f', $level_cm ),
+        level_liter => 0 + sprintf( '%0.1f', $level_liter ),
+        level_pixel => $level_pixel,
+    };
+
+    DEBUG( sprintf "Writing output to log file: %s", $params{output} );
+    open( my $fh_output, '>>', $params{output} ) or die( $! );
+    print $fh_output encode_json( $document ) . "\n";
+    close $fh_output;
+
+    if( $params{work_dir} ){
+        open( my $fh_last, '>', catfile( $params{work_dir}, 'document.json' ) ) or die( $! );
+        printf $fh_last JSON->new->utf8->pretty->encode( $document ) . "\n";
+        close $fh_last;
+    }
 }
 
 

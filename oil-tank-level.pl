@@ -83,7 +83,7 @@ if( $err ){
     die( $err );
 }
 
-# Do 
+ # output edge detection image for visual confirmation
 if( $logger->is_debug and $params{work_dir} ){
     my $edge_file = catfile( $params{work_dir}, 'edge.png' );
     DEBUG( "Writing edge image out to $edge_file" ); 

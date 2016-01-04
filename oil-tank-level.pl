@@ -117,6 +117,9 @@ foreach( 0 .. $#pixels ){
         last;
     }
 }
+if( not $level_pixel ){
+    die( "Level not found..." );
+}
 DEBUG( sprintf "Line is at %0.1f", $level_pixel );
 
 my( $before, $after );

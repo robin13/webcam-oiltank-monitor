@@ -118,7 +118,7 @@ foreach( 0 .. $#pixels ){
     }
 }
 if( not $level_pixel ){
-    die( "Level not found..." );
+    LOGDIE( "Level not found..." );
 }
 DEBUG( sprintf "Line is at %0.1f", $level_pixel );
 
@@ -133,6 +133,9 @@ foreach( sort { $mapping->{$a} <=> $mapping->{$b} } keys( %{ $mapping } ) ){
         DEBUG( "Setting after: $_" );
         $after = $_;
     }
+}
+if( not $before or not $after ){
+    LOGDIE( "Could not find before and after pixel positions..." );
 }
 DEBUG( sprintf "Before: %u cm | %u px", $before, $mapping->{$before} );
 DEBUG( sprintf "After: %u cm | %u px", $after, $mapping->{$after} );
